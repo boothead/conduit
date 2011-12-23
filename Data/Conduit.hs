@@ -123,37 +123,52 @@ infixr 0 =$
 (=$) :: Resource m => Conduit a m b -> Sink b m c -> Sink a m c
 Conduit mc =$ Sink ms = Sink $ do
     s <- ms
-    case s of
-        SinkData pushI closeI -> mc >>= go pushI closeI
-        SinkNoData mres -> return $ SinkNoData mres
+    istate <-
+        newRef $ case s of
+            SinkData pushI closeI -> Left (pushI, closeI)
+            SinkNoData res -> Right res
+    mc >>= go istate
   where
-    go pushI closeI c = do
+    go istate c = do
         return SinkData
             { sinkPush = \cinput -> do
-                res <- conduitPush c cinput
-                case res of
-                    ConduitResult Processing sinput -> do
-                        mres <- pushI sinput
-                        case mres of
-                            Processing -> return Processing
-                            Done (SinkResult _sleftover res') -> do
-                                ConduitResult cleftover _ <- conduitClose c
+                state <- readRef istate
+                case state of
+                    Left (pushI, closeI) -> do
+                        res <- conduitPush c cinput
+                        case res of
+                            ConduitResult Processing sinput -> do
+                                mres <- pushI sinput
+                                case mres of
+                                    Processing -> return ()
+                                    Done (SinkResult _sleftover res') ->
+                                        writeRef istate $ Right res'
+                                return Processing
+                            ConduitResult (Done cleftover) sinput -> do
+                                mres <- pushI sinput
+                                res' <-
+                                    case mres of
+                                        Done (SinkResult _ x) -> return x
+                                        Processing -> closeI
                                 return $ Done $ SinkResult cleftover res'
-                    ConduitResult (Done cleftover) sinput -> do
+                    Right final -> do
+                        res <- conduitPush c cinput
+                        case res of
+                            ConduitResult Processing _ -> return Processing
+                            ConduitResult (Done cleftover) _ ->
+                                return $ Done $ SinkResult cleftover final
+            , sinkClose = do
+                state <- readRef istate
+                case state of
+                    Left (pushI, closeI) -> do
+                        ConduitResult cleftover sinput <- conduitClose c
                         mres <- pushI sinput
-                        res' <-
+                        res <-
                             case mres of
                                 Done (SinkResult _ x) -> return x
                                 Processing -> closeI
-                        return $ Done $ SinkResult cleftover res'
-            , sinkClose = do
-                ConduitResult cleftover sinput <- conduitClose c
-                mres <- pushI sinput
-                res <-
-                    case mres of
-                        Done (SinkResult _ x) -> return x
-                        Processing -> closeI
-                return res
+                        return res
+                    Right res -> return res
             }
 
 infixr 0 =$=
